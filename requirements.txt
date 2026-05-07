@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy==1.26.4
+scikit-learn==1.3.2
+scipy
+matplotlib
+seaborn
+plotly
+yfinance
+nltk
+requests
+chardet
+torch
+torchvision
+torchaudio
