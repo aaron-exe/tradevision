@@ -327,12 +327,29 @@ class NBeatsTrainer:
                 # Shift sequence and add new prediction
                 current_sequence = torch.cat([current_sequence[1:], new_row.unsqueeze(0)], dim=0)
         
-        predictions = np.array(predictions).reshape(-1, 1)
-        
-        # Inverse transform to get actual prices
-        predictions_actual = preprocessor.inverse_transform_target(predictions)
-        
-        return predictions_actual
+        try:
+            predictions = np.array(predictions).reshape(-1, 1)
+            
+            # Inverse transform to get actual prices
+            predictions_actual = preprocessor.inverse_transform_target(predictions)
+            
+            # Apply safety bounds to prevent explosive/unrealistic predictions
+            # Limit max daily change to +/- 10%
+            last_actual = preprocessor.inverse_transform_target(np.array([[last_sequence[-1, 0]]]))[0, 0]
+            bounded_predictions = []
+            prev_val = last_actual
+            for pred in predictions_actual.flatten():
+                max_change = prev_val * 0.10
+                bounded_val = np.clip(pred, prev_val - max_change, prev_val + max_change)
+                bounded_predictions.append(bounded_val)
+                prev_val = bounded_val
+                
+            return np.array(bounded_predictions).reshape(-1, 1)
+            
+        except Exception as e:
+            logger.error(f"Error in N-BEATS prediction fallback: {e}")
+            # Fallback: Flat line prediction if something fails
+            return np.ones((n_days, 1)) * preprocessor.inverse_transform_target(np.array([[last_sequence[-1, 0]]]))[0, 0]
     
     def get_training_history(self):
         """

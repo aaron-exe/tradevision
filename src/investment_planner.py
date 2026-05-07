@@ -1,414 +1,545 @@
 """
-Investment Planner Module
-AI-powered investment planning and portfolio allocation engine.
-Reuses existing TradingSignals, RiskAnalyzer, StockDataFetcher, and FeatureEngineer
-to generate intelligent stock recommendations and capital allocation strategies.
+Investment Planner Module — Production-Grade Portfolio Construction Engine.
+Features: multi-market universes, feasibility engine, strategy-differentiated scoring,
+goal-based risk derivation, allocation constraints, bull/base/bear projections.
 """
-
-import pandas as pd
+import math
 import numpy as np
-from datetime import datetime, timedelta
+import pandas as pd
+from datetime import datetime
 import logging
+import streamlit as st
 
 from src.data_fetcher import StockDataFetcher
 from src.feature_engineering import FeatureEngineer
 from src.trading_signals import TradingSignals
 from src.risk_metrics import RiskAnalyzer
+from src.stock_universes import (
+    MARKET_CHOICES, STRATEGY_CHOICES, GOAL_MODES,
+    get_sectors_for_market, get_universe, get_universe_size,
+    US_STOCKS, INDIAN_STOCKS, INTERNATIONAL_STOCKS, MARKET_UNIVERSES,
+)
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Re-export for app.py imports
+__all__ = [
+    'InvestmentPlanner', 'FeasibilityEngine',
+    'MARKET_CHOICES', 'STRATEGY_CHOICES', 'GOAL_MODES', 'TIMEFRAME_MAP',
+    'get_sectors_for_market', 'get_universe_size',
+]
 
-# Curated stock universe with sector classification
-STOCK_UNIVERSE = {
-    'AAPL': {'name': 'Apple Inc.', 'sector': 'Technology'},
-    'GOOGL': {'name': 'Alphabet Inc.', 'sector': 'Technology'},
-    'MSFT': {'name': 'Microsoft Corp.', 'sector': 'Technology'},
-    'TSLA': {'name': 'Tesla Inc.', 'sector': 'Technology'},
-    'AMZN': {'name': 'Amazon.com Inc.', 'sector': 'Consumer Cyclical'},
-    'META': {'name': 'Meta Platforms Inc.', 'sector': 'Technology'},
-    'NFLX': {'name': 'Netflix Inc.', 'sector': 'Communication Services'},
-    'NVDA': {'name': 'NVIDIA Corp.', 'sector': 'Technology'},
-    'KO': {'name': 'Coca-Cola Co.', 'sector': 'Consumer Defensive'},
-    'JNJ': {'name': 'Johnson & Johnson', 'sector': 'Healthcare'},
-    'WMT': {'name': 'Walmart Inc.', 'sector': 'Consumer Defensive'},
-    'PG': {'name': 'Procter & Gamble Co.', 'sector': 'Consumer Defensive'},
-    'JPM': {'name': 'JPMorgan Chase & Co.', 'sector': 'Financial Services'},
-    'BAC': {'name': 'Bank of America Corp.', 'sector': 'Financial Services'},
-    'V': {'name': 'Visa Inc.', 'sector': 'Financial Services'},
-    'MA': {'name': 'Mastercard Inc.', 'sector': 'Financial Services'},
-    'DIS': {'name': 'Walt Disney Co.', 'sector': 'Communication Services'},
-    'MCD': {'name': "McDonald's Corp.", 'sector': 'Consumer Cyclical'},
-    'NKE': {'name': 'Nike Inc.', 'sector': 'Consumer Cyclical'},
-    'XOM': {'name': 'Exxon Mobil Corp.', 'sector': 'Energy'},
-    'CVX': {'name': 'Chevron Corp.', 'sector': 'Energy'},
-    'PFE': {'name': 'Pfizer Inc.', 'sector': 'Healthcare'},
-    'UNH': {'name': 'UnitedHealth Group Inc.', 'sector': 'Healthcare'},
-    'HD': {'name': 'Home Depot Inc.', 'sector': 'Consumer Cyclical'},
-}
-
-# Available sectors derived from universe
-AVAILABLE_SECTORS = sorted(set(info['sector'] for info in STOCK_UNIVERSE.values()))
-
-# Timeframe mappings
 TIMEFRAME_MAP = {
-    '1 Month': {'months': 1, 'trading_days': 21},
-    '3 Months': {'months': 3, 'trading_days': 63},
-    '6 Months': {'months': 6, 'trading_days': 126},
-    '1 Year': {'months': 12, 'trading_days': 252},
-    '2 Years': {'months': 24, 'trading_days': 504},
+    '3 Months': {'months': 3, 'years': 0.25, 'trading_days': 63},
+    '6 Months': {'months': 6, 'years': 0.5, 'trading_days': 126},
+    '1 Year':   {'months': 12, 'years': 1.0, 'trading_days': 252},
+    '2 Years':  {'months': 24, 'years': 2.0, 'trading_days': 504},
+    '3 Years':  {'months': 36, 'years': 3.0, 'trading_days': 756},
+    '5 Years':  {'months': 60, 'years': 5.0, 'trading_days': 1260},
 }
 
+MAX_CANDIDATES = 30  # performance cap on data fetches
 
+# ── Strategy configuration ────────────────────────────────────────────────
+STRATEGY_WEIGHTS = {
+    'Growth': {
+        'signal': 0.20, 'momentum': 0.30, 'sharpe': 0.10,
+        'vol_pen': 0.05, 'dd_pen': 0.10, 'sector': 0.20, 'div': 0.00, 'volume': 0.05,
+        'preferred': ['Technology', 'Consumer Cyclical', 'Healthcare', 'Communication Services'],
+        'sector_boost': 1.5, 'vol_tolerance': 1.3,
+    },
+    'Value': {
+        'signal': 0.15, 'momentum': 0.10, 'sharpe': 0.30,
+        'vol_pen': 0.20, 'dd_pen': 0.15, 'sector': 0.10, 'div': 0.00, 'volume': 0.00,
+        'preferred': ['Financial Services', 'Consumer Defensive', 'Industrials', 'Healthcare'],
+        'sector_boost': 1.4, 'vol_tolerance': 0.7,
+    },
+    'Dividend': {
+        'signal': 0.10, 'momentum': 0.05, 'sharpe': 0.15,
+        'vol_pen': 0.20, 'dd_pen': 0.10, 'sector': 0.15, 'div': 0.25, 'volume': 0.00,
+        'preferred': ['Utilities', 'Consumer Defensive', 'Real Estate', 'Energy'],
+        'sector_boost': 1.6, 'vol_tolerance': 0.5,
+    },
+    'Momentum': {
+        'signal': 0.40, 'momentum': 0.15, 'sharpe': 0.05,
+        'vol_pen': 0.05, 'dd_pen': 0.10, 'sector': 0.05, 'div': 0.00, 'volume': 0.20,
+        'preferred': [],
+        'sector_boost': 1.0, 'vol_tolerance': 1.2,
+    },
+    'AI Optimized': {
+        'signal': 0.20, 'momentum': 0.20, 'sharpe': 0.20,
+        'vol_pen': 0.15, 'dd_pen': 0.10, 'sector': 0.05, 'div': 0.00, 'volume': 0.10,
+        'preferred': [],
+        'sector_boost': 1.0, 'vol_tolerance': 1.0,
+    },
+}
+
+# ── Feasibility Engine ────────────────────────────────────────────────────
+class FeasibilityEngine:
+    """Analyzes goal realism and derives required risk exposure."""
+
+    @staticmethod
+    def normalize_goal(amount, goal_mode, goal_value, years):
+        """Convert any goal mode to required CAGR and target value."""
+        if goal_mode == 'Target Return %':
+            target_value = amount * (1 + goal_value / 100.0)
+        elif goal_mode == 'Target Final Value':
+            target_value = goal_value
+        elif goal_mode == 'Target Profit':
+            target_value = amount + goal_value
+        else:
+            target_value = amount * (1 + goal_value / 100.0)
+
+        if target_value <= amount:
+            return 0.0, target_value, 0.0
+
+        if years <= 0:
+            years = 1.0
+        required_cagr = (target_value / amount) ** (1.0 / years) - 1.0
+        annualized_return_pct = required_cagr * 100.0
+        return required_cagr, target_value, annualized_return_pct
+
+    @staticmethod
+    def classify(required_cagr):
+        """5-tier feasibility classification."""
+        pct = required_cagr * 100
+        if pct <= 8:
+            return 'Conservative', '#10b981', 'Target appears achievable with diversified market exposure. Historical S&P 500 average is ~10% CAGR.'
+        elif pct <= 18:
+            return 'Realistic', '#3b82f6', 'Target requires above-average stock picking but is historically plausible with a growth-oriented portfolio.'
+        elif pct <= 45:
+            return 'Aggressive', '#f59e0b', 'Target requires concentrated positions and elevated volatility. Above-market performance needed.'
+        elif pct <= 80:
+            return 'Speculative', '#ef4444', 'Target exceeds typical equity returns. Very high risk of underperformance. Consider a longer timeframe or lower target.'
+        else:
+            return 'Unrealistic', '#dc2626', 'Requested return exceeds historically sustainable market returns. Capital loss is highly probable at this risk level.'
+
+    @staticmethod
+    def estimate_probability(required_cagr):
+        """Rough probability estimate using historical equity return distribution."""
+        # Historical US equity: mean ~10%, std ~16%
+        mu, sigma = 0.10, 0.16
+        if sigma == 0:
+            return 50.0
+        z = (required_cagr - mu) / sigma
+        # Approximate CDF using error function
+        prob_achieving = 0.5 * (1 - math.erf(z / math.sqrt(2)))
+        return round(max(1, min(99, prob_achieving * 100)), 0)
+
+    @staticmethod
+    def derive_risk_profile(required_cagr, user_preference):
+        """Derive actual risk profile from target. User preference is advisory."""
+        pct = required_cagr * 100
+        if pct <= 8:
+            derived = 'Low'
+        elif pct <= 18:
+            derived = 'Medium'
+        else:
+            derived = 'High'
+
+        # Check for mismatch
+        risk_levels = {'Low': 0, 'Medium': 1, 'High': 2}
+        mismatch = False
+        mismatch_msg = ''
+        if risk_levels.get(derived, 1) > risk_levels.get(user_preference, 1):
+            mismatch = True
+            mismatch_msg = (
+                f'Your target requires {derived.lower()}-risk exposure, '
+                f'but you selected {user_preference.lower()} risk preference. '
+                f'The portfolio will be adjusted toward {derived.lower()} risk to pursue your target.'
+            )
+
+        return {
+            'derived': derived,
+            'user_preference': user_preference,
+            'effective': derived if mismatch else user_preference,
+            'mismatch': mismatch,
+            'mismatch_message': mismatch_msg,
+        }
+
+
+# ── Main Planner ──────────────────────────────────────────────────────────
 class InvestmentPlanner:
-    """AI-powered investment planner using existing analysis systems."""
+    """Production-grade investment planner with multi-market support."""
 
     def __init__(self):
         self.fetcher = StockDataFetcher()
         self.engineer = FeatureEngineer()
 
-    def generate_plan(self, investment_amount, target_return_pct,
-                      timeframe='1 Year', risk_tolerance='Medium',
-                      sector_preferences=None, strategy='AI-selected',
-                      num_stocks=5, progress_callback=None):
-        """
-        Generate a complete investment plan.
-
-        Args:
-            investment_amount (float): Total capital to invest (USD).
-            target_return_pct (float): Desired return percentage.
-            timeframe (str): Investment horizon key from TIMEFRAME_MAP.
-            risk_tolerance (str): 'Low', 'Medium', or 'High'.
-            sector_preferences (list|None): Sectors to focus on, or None for all.
-            strategy (str): Investment strategy preference.
-            num_stocks (int): Desired number of stocks in allocation.
-            progress_callback (callable|None): fn(pct, msg) for progress updates.
-
-        Returns:
-            dict: Complete investment plan with allocations, projections, and analysis.
-        """
+    def generate_plan(self, investment_amount, goal_mode, goal_value,
+                      timeframe='1 Year', risk_preference='Medium',
+                      market='US Stocks', sector_preferences=None,
+                      strategy='AI Optimized', num_stocks=5,
+                      progress_callback=None):
         if progress_callback is None:
-            progress_callback = lambda pct, msg: None
+            progress_callback = lambda p, m: None
 
         tf = TIMEFRAME_MAP.get(timeframe, TIMEFRAME_MAP['1 Year'])
-        target_return_decimal = target_return_pct / 100.0
+        years = tf['years']
 
-        # Step 1 — Determine candidate tickers
-        progress_callback(0.05, "Identifying candidate stocks...")
-        candidates = self._get_candidates(sector_preferences)
+        # ── Feasibility Analysis ──
+        progress_callback(0.02, 'Analyzing goal feasibility...')
+        req_cagr, target_value, ann_return_pct = FeasibilityEngine.normalize_goal(
+            investment_amount, goal_mode, goal_value, years)
+        feas_label, feas_color, feas_text = FeasibilityEngine.classify(req_cagr)
+        probability = FeasibilityEngine.estimate_probability(req_cagr)
+        risk_profile = FeasibilityEngine.derive_risk_profile(req_cagr, risk_preference)
+        effective_risk = risk_profile['effective']
 
-        # Step 2 — Fetch data and score every candidate
-        progress_callback(0.10, "Fetching market data & scoring stocks...")
-        scored = self._score_candidates(candidates, risk_tolerance, strategy,
-                                        tf, progress_callback)
+        feasibility = {
+            'required_cagr': round(req_cagr * 100, 2),
+            'target_value': round(target_value, 2),
+            'annualized_return_pct': round(ann_return_pct, 2),
+            'label': feas_label, 'color': feas_color, 'text': feas_text,
+            'probability': probability,
+            'risk_profile': risk_profile,
+        }
+
+        # ── Candidate Selection ──
+        progress_callback(0.05, 'Selecting candidate universe...')
+        candidates = self._get_candidates(market, sector_preferences, strategy)
+
+        # ── Score Candidates ──
+        progress_callback(0.10, 'Fetching market data & scoring...')
+        scored = self._score_candidates(candidates, effective_risk, strategy, tf, progress_callback)
 
         if not scored:
-            return {'success': False,
-                    'message': 'Unable to fetch data for any candidate stocks. Please try again.'}
+            return {'success': False, 'message': 'Unable to fetch data for any candidates. Try again.'}
 
-        # Step 3 — Select top N and allocate
-        progress_callback(0.80, "Generating optimal allocation...")
+        # ── Allocate ──
+        progress_callback(0.85, 'Constructing portfolio...')
         selected = scored[:min(num_stocks, len(scored))]
-        allocations = self._allocate_capital(selected, investment_amount,
-                                             target_return_decimal, tf,
-                                             risk_tolerance)
+        allocations = self._allocate(selected, investment_amount, effective_risk, strategy)
 
-        # Step 4 — Portfolio-level analytics
-        progress_callback(0.90, "Computing portfolio analytics...")
-        portfolio_analytics = self._compute_portfolio_analytics(
-            allocations, investment_amount, target_return_pct, tf, risk_tolerance)
+        # ── Analytics ──
+        progress_callback(0.92, 'Computing analytics...')
+        analytics = self._analytics(allocations, investment_amount, feasibility, tf, market)
 
-        progress_callback(1.0, "Investment plan ready!")
-
+        progress_callback(1.0, 'Investment plan ready!')
         return {
             'success': True,
             'allocations': allocations,
-            'analytics': portfolio_analytics,
+            'analytics': analytics,
+            'feasibility': feasibility,
             'parameters': {
                 'investment_amount': investment_amount,
-                'target_return_pct': target_return_pct,
+                'goal_mode': goal_mode,
+                'goal_value': goal_value,
+                'target_value': target_value,
                 'timeframe': timeframe,
                 'timeframe_info': tf,
-                'risk_tolerance': risk_tolerance,
+                'risk_preference': risk_preference,
+                'effective_risk': effective_risk,
+                'market': market,
                 'sector_preferences': sector_preferences,
                 'strategy': strategy,
                 'num_stocks': num_stocks,
                 'generated_at': datetime.now().isoformat(),
-            }
+            },
         }
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # ── Candidate selection ───────────────────────────────────────────────
+    def _get_candidates(self, market, sector_prefs, strategy):
+        universe = get_universe(market)
+        # Sector filter
+        if sector_prefs:
+            universe = {t: v for t, v in universe.items() if v['sector'] in sector_prefs}
 
-    def _get_candidates(self, sector_preferences):
-        """Filter stock universe by sector preferences."""
-        if sector_preferences and len(sector_preferences) > 0:
-            return {t: info for t, info in STOCK_UNIVERSE.items()
-                    if info['sector'] in sector_preferences}
-        return dict(STOCK_UNIVERSE)
+        # If too many, prioritize strategy-aligned sectors, then cap
+        sw = STRATEGY_WEIGHTS.get(strategy, STRATEGY_WEIGHTS['AI Optimized'])
+        preferred = sw['preferred']
 
-    def _score_candidates(self, candidates, risk_tolerance, strategy, tf,
-                          progress_callback):
-        """
-        Fetch 1-year data for each candidate, compute signals & risk,
-        and return a sorted list of scored stock dicts.
-        """
+        if len(universe) > MAX_CANDIDATES:
+            preferred_stocks = {t: v for t, v in universe.items() if v['sector'] in preferred}
+            other_stocks = {t: v for t, v in universe.items() if v['sector'] not in preferred}
+            # Take all preferred, fill remainder from others
+            n_other = MAX_CANDIDATES - len(preferred_stocks)
+            if n_other > 0:
+                other_list = list(other_stocks.items())[:n_other]
+                result = dict(preferred_stocks)
+                result.update(dict(other_list))
+                return result
+            else:
+                return dict(list(preferred_stocks.items())[:MAX_CANDIDATES])
+
+        return universe
+
+    @staticmethod
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _fetch_and_prepare_data(_fetcher, _engineer, ticker):
+        df = _fetcher.fetch_stock_data(ticker, period='1y')
+        if df is None or df.empty or len(df) < 60:
+            return None
+        return _engineer.add_all_indicators(df)
+
+    def _score_candidates(self, candidates, risk_level, strategy, tf, progress_cb):
         scored = []
         total = len(candidates)
+        sw = STRATEGY_WEIGHTS.get(strategy, STRATEGY_WEIGHTS['AI Optimized'])
 
         for idx, (ticker, info) in enumerate(candidates.items()):
-            pct = 0.10 + 0.65 * ((idx + 1) / total)
-            progress_callback(pct, f"Analyzing {info['name']} ({ticker})...")
+            pct = 0.10 + 0.70 * ((idx + 1) / total)
+            progress_cb(pct, f'Analyzing {info["name"]} ({ticker})...')
             try:
-                df = self.fetcher.fetch_stock_data(ticker, period='1y')
-                if df is None or df.empty or len(df) < 60:
+                df = self._fetch_and_prepare_data(self.fetcher, self.engineer, ticker)
+                if df is None:
                     continue
 
-                df = self.engineer.add_all_indicators(df)
-
-                # --- Trading Signals ---
                 signals = TradingSignals.get_comprehensive_signals(df)
                 overall = signals['overall']
-                buy_score = overall['buy_score']
-                sell_score = overall['sell_score']
+                risk_m = RiskAnalyzer.get_comprehensive_risk_metrics(df)
+                risk_rating = RiskAnalyzer.get_risk_rating(risk_m)
+
+                buy_sc = overall['buy_score']
+                sell_sc = overall['sell_score']
                 confidence = overall['confidence']
-                recommendation = overall['recommendation']
+                vol = risk_m['annualized_volatility_pct']
+                sharpe = risk_m['sharpe_ratio']
+                max_dd = abs(risk_m['max_drawdown_pct'])
+                mean_ret = risk_m['mean_return_pct']
+                price = float(df['Close'].iloc[-1])
 
-                # --- Risk Metrics ---
-                risk_metrics = RiskAnalyzer.get_comprehensive_risk_metrics(df)
-                risk_rating = RiskAnalyzer.get_risk_rating(risk_metrics)
-                volatility = risk_metrics['annualized_volatility_pct']
-                sharpe = risk_metrics['sharpe_ratio']
-                max_dd = abs(risk_metrics['max_drawdown_pct'])
-                mean_return_pct = risk_metrics['mean_return_pct']
+                # Volume confirmation
+                vol_ratio = 1.0
+                if 'Volume_Ratio' in df.columns:
+                    vol_ratio = float(df['Volume_Ratio'].iloc[-1])
 
-                current_price = float(df['Close'].iloc[-1])
+                composite = self._composite(
+                    buy_sc, sell_sc, confidence, sharpe, vol, max_dd, mean_ret,
+                    info, sw, risk_level, vol_ratio)
 
-                # --- Composite score ---
-                composite = self._compute_composite_score(
-                    buy_score, sell_score, confidence, sharpe, volatility,
-                    max_dd, mean_return_pct, risk_tolerance, strategy)
+                # ── Financial Realism Calibration ──
+                # 1. Baseline Priors per Strategy
+                baseline_cagrs = {
+                    'Dividend': 0.07,
+                    'Value': 0.085,
+                    'AI Optimized': 0.11,
+                    'Growth': 0.14,
+                    'Momentum': 0.17
+                }
+                base_cagr = baseline_cagrs.get(strategy, 0.11)
+                
+                # Adjust baseline based on risk preference (advisory nudge)
+                risk_nudge = {'Low': -0.02, 'Medium': 0.0, 'High': 0.03}.get(risk_level, 0.0)
+                base_cagr += risk_nudge
 
-                # --- Projected upside (annualized mean return scaled to timeframe) ---
-                trading_days = tf['trading_days']
-                projected_return_pct = (risk_metrics['mean_return'] * trading_days) * 100
-                # Clamp to reasonable bounds
-                projected_return_pct = max(-50, min(projected_return_pct, 200))
+                # 2. Historical Bounding & Confidence Shrinkage
+                # risk_m['mean_return'] is already annualized return.
+                hist_cagr = max(-0.15, min(risk_m['mean_return'], 0.25))
+                conf_weight = min(confidence / 100.0, 0.85) # Never trust ML 100%
+                shrunk_cagr = (hist_cagr * conf_weight) + (base_cagr * (1 - conf_weight))
 
-                # --- Reasoning text ---
-                reasoning = self._generate_reasoning(
-                    ticker, info['name'], recommendation, confidence,
-                    volatility, sharpe, mean_return_pct, risk_rating, signals)
+                # 3. ML Alpha Bounding
+                ml_signal = (buy_sc - sell_sc) / 100.0  # -1.0 to 1.0
+                max_alpha = 0.06 if strategy in ('Growth', 'Momentum') else 0.04
+                ml_alpha = ml_signal * max_alpha
+
+                # 4. Volatility Drag Integration (Geometric compounding penalty)
+                annual_vol = risk_m['volatility'] # typically 0.15 to 0.60
+                vol_drag = (annual_vol ** 2) / 2.0
+
+                expected_cagr = shrunk_cagr + ml_alpha - vol_drag
+                
+                # Hard bounds for institutional realism
+                expected_cagr = max(-0.05, min(expected_cagr, 0.35))
+                
+                # 5. Timeframe Projection (Geometric)
+                years = tf['years']
+                proj_ret = ((1 + expected_cagr) ** years - 1) * 100
+                daily_std = annual_vol / math.sqrt(252) if annual_vol > 0 else 0.01
+
+                reasoning = self._reasoning(
+                    info['name'], overall['recommendation'], confidence,
+                    vol, sharpe, mean_ret, risk_rating, signals)
 
                 scored.append({
-                    'ticker': ticker,
-                    'name': info['name'],
-                    'sector': info['sector'],
-                    'current_price': current_price,
-                    'composite_score': composite,
-                    'buy_score': buy_score,
-                    'sell_score': sell_score,
-                    'confidence': confidence,
-                    'recommendation': recommendation,
-                    'volatility': volatility,
-                    'sharpe': sharpe,
-                    'max_drawdown': max_dd,
-                    'mean_return_pct': mean_return_pct,
-                    'projected_return_pct': projected_return_pct,
-                    'risk_rating': risk_rating,
-                    'reasoning': reasoning,
+                    'ticker': ticker, 'name': info['name'], 'sector': info['sector'],
+                    'div_tier': info.get('div_tier', 'low'),
+                    'current_price': price, 'composite_score': composite,
+                    'buy_score': buy_sc, 'sell_score': sell_sc,
+                    'confidence': confidence, 'recommendation': overall['recommendation'],
+                    'volatility': vol, 'sharpe': sharpe, 'max_drawdown': max_dd,
+                    'mean_return_pct': mean_ret, 'projected_return_pct': proj_ret,
+                    'expected_cagr': expected_cagr,
+                    'daily_std': daily_std, 'risk_rating': risk_rating, 'reasoning': reasoning,
                 })
-
             except Exception as e:
-                logger.warning(f"Skipping {ticker}: {e}")
+                logger.warning(f'Skipping {ticker}: {e}')
                 continue
 
-        # Sort by composite score descending
         scored.sort(key=lambda s: s['composite_score'], reverse=True)
         return scored
 
-    def _compute_composite_score(self, buy_score, sell_score, confidence,
-                                  sharpe, volatility, max_dd, mean_return_pct,
-                                  risk_tolerance, strategy):
-        """
-        Weighted composite score combining signal strength, risk-adjusted
-        return quality, and user-preference modifiers.
-        """
-        # Base signal score (0-100 range)
-        signal_score = max(0, buy_score - sell_score) + (confidence / 2)
+    def _composite(self, buy_sc, sell_sc, conf, sharpe, vol, max_dd, mean_ret,
+                   info, sw, risk_level, vol_ratio):
+        """Strategy-differentiated composite scoring."""
+        # Normalized sub-scores (0-100 scale)
+        signal = max(0, buy_sc - sell_sc) + conf * 0.5
+        momentum = max(0, min(mean_ret * 2, 100))
+        sharpe_s = max(0, min(sharpe * 25, 100))
+        vol_pen = max(0, min(vol * 1.5, 100))
+        dd_pen = max(0, min(max_dd, 100))
+        vol_confirm = max(0, min(vol_ratio * 30, 100))
 
-        # Risk-adjusted return score
-        sharpe_score = max(0, min(sharpe * 20, 50))  # 0-50
-        return_score = max(0, min(mean_return_pct, 50))  # 0-50
+        # Dividend quality score
+        div_map = {'high': 90, 'medium': 55, 'low': 20, 'none': 0}
+        div_score = div_map.get(info.get('div_tier', 'low'), 20)
 
-        # Volatility penalty (lower vol = higher score)
-        vol_penalty = max(0, min(volatility / 2, 25))
-
-        # Drawdown penalty
-        dd_penalty = max(0, min(max_dd / 3, 20))
-
-        # Risk tolerance modifier
-        risk_mult = {'Low': 0.6, 'Medium': 1.0, 'High': 1.4}.get(risk_tolerance, 1.0)
-
-        # Strategy modifiers
-        strat_bonus = 0
-        if strategy == 'Growth':
-            strat_bonus = return_score * 0.3
-        elif strategy == 'Value':
-            strat_bonus = sharpe_score * 0.3 - vol_penalty * 0.2
-        elif strategy == 'Dividend':
-            strat_bonus = -vol_penalty * 0.3  # favor low-vol
-        elif strategy == 'Momentum':
-            strat_bonus = signal_score * 0.3
-
-        composite = (
-            signal_score * 0.35
-            + sharpe_score * 0.20
-            + return_score * 0.20
-            - vol_penalty * 0.10 * (2 - risk_mult)
-            - dd_penalty * 0.10
-            + strat_bonus * 0.05
-        ) * risk_mult
-
-        return round(max(0, composite), 2)
-
-    def _allocate_capital(self, selected, investment_amount,
-                          target_return_decimal, tf, risk_tolerance):
-        """
-        Distribute capital across selected stocks proportionally
-        to their composite scores, then compute per-stock metrics.
-        """
-        total_score = sum(s['composite_score'] for s in selected)
-        if total_score == 0:
-            total_score = 1  # prevent div-by-zero
-
-        allocations = []
-        for stock in selected:
-            raw_pct = (stock['composite_score'] / total_score) * 100
-            alloc_pct = round(raw_pct, 1)
-            alloc_amount = round(investment_amount * (alloc_pct / 100), 2)
-
-            # Estimated shares (fractional)
-            est_shares = round(alloc_amount / stock['current_price'], 4) if stock['current_price'] > 0 else 0
-
-            # Expected return contribution (proportion of this stock's projected return)
-            stock_return = alloc_amount * (stock['projected_return_pct'] / 100)
-
-            allocations.append({
-                **stock,
-                'allocation_pct': alloc_pct,
-                'allocation_amount': alloc_amount,
-                'estimated_shares': est_shares,
-                'expected_return_contribution': round(stock_return, 2),
-            })
-
-        # Normalize percentages to exactly 100%
-        total_pct = sum(a['allocation_pct'] for a in allocations)
-        if total_pct != 100 and len(allocations) > 0:
-            diff = 100 - total_pct
-            allocations[0]['allocation_pct'] = round(allocations[0]['allocation_pct'] + diff, 1)
-            allocations[0]['allocation_amount'] = round(
-                investment_amount * (allocations[0]['allocation_pct'] / 100), 2)
-
-        return allocations
-
-    def _compute_portfolio_analytics(self, allocations, investment_amount,
-                                      target_return_pct, tf, risk_tolerance):
-        """Compute portfolio-level summary analytics."""
-        if not allocations:
-            return {}
-
-        # Weighted metrics
-        total_alloc = sum(a['allocation_pct'] for a in allocations)
-        w_volatility = sum(a['volatility'] * a['allocation_pct'] / total_alloc
-                           for a in allocations)
-        w_sharpe = sum(a['sharpe'] * a['allocation_pct'] / total_alloc
-                       for a in allocations)
-        w_projected_return = sum(a['projected_return_pct'] * a['allocation_pct'] / total_alloc
-                                 for a in allocations)
-        w_confidence = sum(a['confidence'] * a['allocation_pct'] / total_alloc
-                           for a in allocations)
-        total_expected_return = sum(a['expected_return_contribution'] for a in allocations)
-
-        # Diversification score (based on sector spread + count)
-        sectors = set(a['sector'] for a in allocations)
-        max_single_pct = max(a['allocation_pct'] for a in allocations)
-        diversification_score = min(100, (
-            len(sectors) / len(AVAILABLE_SECTORS) * 40
-            + len(allocations) / 10 * 30
-            + (100 - max_single_pct) / 100 * 30
-        ))
-
-        # Portfolio risk score (0-100, lower = less risky)
-        risk_score = min(100, max(0,
-            w_volatility * 1.5
-            + (100 - w_confidence) * 0.3
-            + max_single_pct * 0.2
-        ))
-
-        # Risk label
-        if risk_score < 30:
-            risk_label = 'Low Risk'
-            risk_color = '#10b981'
-        elif risk_score < 55:
-            risk_label = 'Moderate Risk'
-            risk_color = '#f59e0b'
-        elif risk_score < 75:
-            risk_label = 'High Risk'
-            risk_color = '#ef4444'
+        # Sector alignment score
+        sector_s = 0
+        if info['sector'] in sw['preferred']:
+            sector_s = 80 * sw['sector_boost']
         else:
-            risk_label = 'Very High Risk'
-            risk_color = '#dc2626'
+            sector_s = 30
 
-        # Projected portfolio value over time (monthly)
+        # Weighted composite
+        raw = (
+            signal * sw['signal']
+            + momentum * sw['momentum']
+            + sharpe_s * sw['sharpe']
+            - vol_pen * sw['vol_pen'] * (1.5 - {'Low': 0, 'Medium': 0.5, 'High': 1.0}.get(risk_level, 0.5))
+            - dd_pen * sw['dd_pen']
+            + sector_s * sw['sector']
+            + div_score * sw['div']
+            + vol_confirm * sw['volume']
+        )
+
+        # Risk-level multiplier: aggressive goals boost high-vol stocks
+        risk_mult = {'Low': 0.8, 'Medium': 1.0, 'High': 1.2}.get(risk_level, 1.0)
+        if risk_level == 'High':
+            raw += momentum * 0.15  # extra momentum bonus for aggressive
+
+        return round(max(0, raw * risk_mult), 2)
+
+    # ── Allocation with constraints ───────────────────────────────────────
+    def _allocate(self, selected, amount, risk_level, strategy):
+        if not selected:
+            return []
+
+        total_score = sum(s['composite_score'] for s in selected) or 1
+        MAX_SINGLE = 25.0
+        MAX_SECTOR = 40.0
+        MIN_ALLOC = 3.0
+
+        # Initial score-proportional allocation
+        allocs = []
+        for s in selected:
+            pct = (s['composite_score'] / total_score) * 100
+            allocs.append({**s, 'allocation_pct': pct})
+
+        # Clamp single-stock max
+        for a in allocs:
+            if a['allocation_pct'] > MAX_SINGLE:
+                a['allocation_pct'] = MAX_SINGLE
+
+        # Clamp sector max
+        sector_totals = {}
+        for a in allocs:
+            sector_totals[a['sector']] = sector_totals.get(a['sector'], 0) + a['allocation_pct']
+        for sector, total in sector_totals.items():
+            if total > MAX_SECTOR:
+                stocks_in_sector = [a for a in allocs if a['sector'] == sector]
+                scale = MAX_SECTOR / total
+                for a in stocks_in_sector:
+                    a['allocation_pct'] *= scale
+
+        # Enforce minimum
+        for a in allocs:
+            if a['allocation_pct'] < MIN_ALLOC:
+                a['allocation_pct'] = MIN_ALLOC
+
+        # Normalize to 100%
+        total_pct = sum(a['allocation_pct'] for a in allocs)
+        if total_pct > 0:
+            for a in allocs:
+                a['allocation_pct'] = round(a['allocation_pct'] / total_pct * 100, 1)
+
+        # Fix rounding to exactly 100
+        diff = 100.0 - sum(a['allocation_pct'] for a in allocs)
+        if abs(diff) > 0 and allocs:
+            allocs[0]['allocation_pct'] = round(allocs[0]['allocation_pct'] + diff, 1)
+
+        # Compute dollar amounts
+        for a in allocs:
+            a['allocation_amount'] = round(amount * a['allocation_pct'] / 100, 2)
+            a['estimated_shares'] = round(a['allocation_amount'] / a['current_price'], 4) if a['current_price'] > 0 else 0
+            a['expected_return_contribution'] = round(a['allocation_amount'] * a['projected_return_pct'] / 100, 2)
+
+        return allocs
+
+    # ── Portfolio analytics ───────────────────────────────────────────────
+    def _analytics(self, allocs, amount, feasibility, tf, market):
+        if not allocs:
+            return {}
+        total_pct = sum(a['allocation_pct'] for a in allocs) or 1
+        w = lambda key: sum(a[key] * a['allocation_pct'] / total_pct for a in allocs)
+
+        w_vol = w('volatility')
+        w_sharpe = w('sharpe')
+        w_proj = w('projected_return_pct')
+        w_cagr = w('expected_cagr')
+        w_conf = w('confidence')
+        total_exp_ret = sum(a['expected_return_contribution'] for a in allocs)
+
+        sectors = set(a['sector'] for a in allocs)
+        max_single = max(a['allocation_pct'] for a in allocs)
+        all_sectors = get_sectors_for_market(market)
+        div_score = min(100, len(sectors) / max(len(all_sectors), 1) * 40
+                        + len(allocs) / 10 * 30 + (100 - max_single) / 100 * 30)
+
+        risk_score = min(100, max(0, w_vol * 1.5 + (100 - w_conf) * 0.3 + max_single * 0.2))
+        if risk_score < 30:
+            rl, rc = 'Low Risk', '#10b981'
+        elif risk_score < 55:
+            rl, rc = 'Moderate Risk', '#f59e0b'
+        elif risk_score < 75:
+            rl, rc = 'High Risk', '#ef4444'
+        else:
+            rl, rc = 'Very High Risk', '#dc2626'
+
+        # Bull / Base / Bear trajectories (Probabilistic geometric random walk approximation)
         months = tf['months']
-        monthly_return = w_projected_return / (months if months > 0 else 12) / 100
-        trajectory = []
-        value = investment_amount
-        for m in range(months + 1):
-            trajectory.append({
-                'month': m,
-                'value': round(value, 2),
-            })
-            value *= (1 + monthly_return)
+        # Convert expected annual CAGR to monthly for compounding
+        monthly_cagr = (1 + w_cagr) ** (1 / 12) - 1
+        
+        # Scenario variations (based on volatility)
+        annual_vol_dec = w_vol / 100.0
+        # For scenario trajectory, adjust the monthly growth rate
+        monthly_bull = (1 + w_cagr + annual_vol_dec * 0.5) ** (1 / 12) - 1
+        monthly_bear = (1 + max(w_cagr - annual_vol_dec * 0.7, -0.15)) ** (1 / 12) - 1
 
-        # Target feasibility
-        needed_return = target_return_pct
-        feasibility = 'Likely Achievable' if w_projected_return >= needed_return * 0.8 else (
-            'Stretch Goal' if w_projected_return >= needed_return * 0.5 else 'Ambitious Target')
-        feasibility_color = '#10b981' if feasibility == 'Likely Achievable' else (
-            '#f59e0b' if feasibility == 'Stretch Goal' else '#ef4444')
+        trajectories = {'base': [], 'bull': [], 'bear': []}
+        vals = {'base': amount, 'bull': amount, 'bear': amount}
+        for m in range(months + 1):
+            for scenario in trajectories:
+                trajectories[scenario].append({'month': m, 'value': round(vals[scenario], 2)})
+            vals['base'] *= (1 + monthly_cagr)
+            vals['bull'] *= (1 + monthly_bull)
+            vals['bear'] *= (1 + monthly_bear)
 
         return {
-            'weighted_volatility': round(w_volatility, 2),
+            'weighted_volatility': round(w_vol, 2),
             'weighted_sharpe': round(w_sharpe, 2),
-            'weighted_projected_return': round(w_projected_return, 2),
-            'weighted_confidence': round(w_confidence, 1),
-            'total_expected_return': round(total_expected_return, 2),
-            'total_expected_return_pct': round(
-                (total_expected_return / investment_amount) * 100, 2) if investment_amount > 0 else 0,
-            'diversification_score': round(diversification_score, 1),
+            'weighted_projected_return': round(w_proj, 2),
+            'weighted_expected_cagr': round(w_cagr * 100, 2),
+            'weighted_confidence': round(w_conf, 1),
+            'total_expected_return': round(total_exp_ret, 2),
+            'total_expected_return_pct': round(total_exp_ret / amount * 100, 2) if amount else 0,
+            'diversification_score': round(div_score, 1),
             'risk_score': round(risk_score, 1),
-            'risk_label': risk_label,
-            'risk_color': risk_color,
-            'sectors': list(sectors),
-            'num_sectors': len(sectors),
-            'num_stocks': len(allocations),
-            'trajectory': trajectory,
-            'target_feasibility': feasibility,
-            'target_feasibility_color': feasibility_color,
-            'estimated_final_value': round(trajectory[-1]['value'], 2) if trajectory else investment_amount,
+            'risk_label': rl, 'risk_color': rc,
+            'sectors': list(sectors), 'num_sectors': len(sectors),
+            'num_stocks': len(allocs),
+            'trajectories': trajectories,
+            'estimated_final_value': round(trajectories['base'][-1]['value'], 2),
+            'estimated_final_bull': round(trajectories['bull'][-1]['value'], 2),
+            'estimated_final_bear': round(trajectories['bear'][-1]['value'], 2),
         }
 
+    # ── Reasoning ─────────────────────────────────────────────────────────
     @staticmethod
-    def _generate_reasoning(ticker, name, recommendation, confidence,
-                            volatility, sharpe, mean_return_pct,
-                            risk_rating, signals):
-        """Build a human-readable reasoning summary for a stock pick."""
+    def _reasoning(name, rec, conf, vol, sharpe, mean_ret, risk_rating, signals):
         parts = []
-
-        # Recommendation
         rec_map = {
             'STRONG BUY': f'{name} shows strong bullish signals across multiple indicators.',
             'BUY': f'{name} displays bullish technical momentum.',
@@ -416,32 +547,16 @@ class InvestmentPlanner:
             'SELL': f'{name} shows bearish signals — included for diversification.',
             'STRONG SELL': f'{name} is under selling pressure — minimal allocation.',
         }
-        parts.append(rec_map.get(recommendation,
-                                 f'{name} has a {recommendation} signal.'))
+        parts.append(rec_map.get(rec, f'{name} has a {rec} signal.'))
+        parts.append(f'Risk: {risk_rating["rating"]} (vol {vol:.1f}%, Sharpe {sharpe:.2f}).')
 
-        # Risk profile
-        parts.append(
-            f"Risk profile: {risk_rating['rating']} "
-            f"(volatility {volatility:.1f}%, Sharpe {sharpe:.2f})."
-        )
-
-        # Signal detail
-        sig_details = signals.get('signals', {})
-        bullish = [k for k, v in sig_details.items()
-                   if v.get('signal') in ('BUY',)]
-        bearish = [k for k, v in sig_details.items()
-                   if v.get('signal') in ('SELL',)]
-        if bullish:
-            parts.append(f"Bullish on: {', '.join(bullish)}.")
-        if bearish:
-            parts.append(f"Caution from: {', '.join(bearish)}.")
-
-        # Return
-        if mean_return_pct > 0:
-            parts.append(
-                f"Annualized historical return: +{mean_return_pct:.1f}%.")
-        else:
-            parts.append(
-                f"Annualized historical return: {mean_return_pct:.1f}%.")
-
+        sig_d = signals.get('signals', {})
+        bulls = [k for k, v in sig_d.items() if v.get('signal') == 'BUY']
+        bears = [k for k, v in sig_d.items() if v.get('signal') == 'SELL']
+        if bulls:
+            parts.append(f'Bullish: {", ".join(bulls)}.')
+        if bears:
+            parts.append(f'Caution: {", ".join(bears)}.')
+        sign = '+' if mean_ret > 0 else ''
+        parts.append(f'Annualized return: {sign}{mean_ret:.1f}%.')
         return ' '.join(parts)

@@ -74,9 +74,8 @@ class RiskAnalyzer:
         Returns:
             dict: Max drawdown info
         """
-        cumulative = (1 + prices.pct_change()).cumprod()
-        running_max = cumulative.expanding().max()
-        drawdown = (cumulative - running_max) / running_max
+        running_max = prices.expanding().max()
+        drawdown = (prices - running_max) / running_max
         
         max_dd = drawdown.min()
         max_dd_date = drawdown.idxmin()

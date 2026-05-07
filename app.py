@@ -36,7 +36,11 @@ from src.pattern_recognition import PatternRecognizer
 from src.backtester import Backtester
 from src.alert_system import AlertSystem
 from src.automl import AutoML
-from src.investment_planner import InvestmentPlanner, STOCK_UNIVERSE, AVAILABLE_SECTORS, TIMEFRAME_MAP
+from src.investment_planner import (
+    InvestmentPlanner, FeasibilityEngine,
+    MARKET_CHOICES, STRATEGY_CHOICES, GOAL_MODES, TIMEFRAME_MAP,
+    get_sectors_for_market, get_universe_size,
+)
 import config
 
 # ── Currency Configuration ──────────────────────────────────────────────────────
@@ -589,16 +593,6 @@ if 'model_trained' not in st.session_state:
     transformer_model_exists = os.path.exists('models/transformer_model.pth')
     scalers_exist = (os.path.exists('models/feature_scaler.pkl') and 
                      os.path.exists('models/target_scaler.pkl'))
-    
-    # Delete old Keras .h5 models if they exist (migration to PyTorch)
-    old_keras_models = ['models/lstm_stock_model.h5', 'models/best_model.h5']
-    for old_model in old_keras_models:
-        if os.path.exists(old_model):
-            try:
-                os.remove(old_model)
-                logger.info(f"Removed old Keras model: {old_model}")
-            except Exception as e:
-                logger.warning(f"Could not remove old model {old_model}: {e}")
     
     # Try to load LSTM model if it exists
     if lstm_model_exists and scalers_exist:
@@ -5435,86 +5429,106 @@ if active_tab == 14:
 # ==================== TAB 15: INVESTMENT PLANNER ====================
 if active_tab == 15:
     st.markdown('<h2 class="sub-header">💰 Investment Planner</h2>', unsafe_allow_html=True)
+    st.markdown("AI-powered portfolio construction with real-time market analysis, feasibility assessment, and strategy-aware allocation.")
 
-    st.markdown("""
-    Configure your investment parameters and let the AI-powered engine generate
-    an optimized portfolio allocation based on real-time market analysis, technical
-    signals, and risk metrics.
-    """)
-
-    # ── Input Form ──────────────────────────────────────────────────────────
+    # ── Input Form ──────────────────────────────────────────────────────
     st.markdown("### ⚙️ Investment Parameters")
 
-    req_col1, req_col2 = st.columns(2)
+    top1, top2, top3 = st.columns(3)
+    with top1:
+        ip_market = st.selectbox("🌍 Market", options=MARKET_CHOICES, index=0,
+            help="Choose which market to scan for stocks")
+    with top2:
+        ip_goal_mode = st.selectbox("🎯 Goal Type", options=GOAL_MODES, index=0,
+            help="How you want to specify your investment target")
+    with top3:
+        ip_strategy = st.selectbox("📈 Strategy", options=STRATEGY_CHOICES, index=0,
+            help="Investment philosophy guiding allocation")
 
-    with req_col1:
+    inp1, inp2 = st.columns(2)
+    with inp1:
         ip_amount = st.number_input(
             f"💵 Investment Amount ({get_currency_symbol()})",
-            min_value=100.0, max_value=100_000_000.0,
-            value=10000.0, step=500.0,
-            help="Total capital you plan to invest"
-        )
-
-    with req_col2:
-        ip_target = st.number_input(
-            "🎯 Target Return (%)",
-            min_value=1.0, max_value=500.0,
-            value=20.0, step=1.0,
-            help="Desired percentage return on your investment"
-        )
+            min_value=100.0, max_value=100_000_000.0, value=10000.0, step=500.0,
+            help="Total capital to invest")
+    with inp2:
+        if ip_goal_mode == 'Target Return %':
+            ip_goal_value = st.number_input("🎯 Target Return (%)", min_value=1.0, max_value=500.0, value=20.0, step=1.0)
+        elif ip_goal_mode == 'Target Final Value':
+            ip_goal_value = st.number_input(f"🎯 Target Final Value ({get_currency_symbol()})", min_value=100.0, max_value=1_000_000_000.0, value=12000.0, step=500.0)
+        else:
+            ip_goal_value = st.number_input(f"🎯 Target Profit ({get_currency_symbol()})", min_value=1.0, max_value=100_000_000.0, value=2000.0, step=100.0)
 
     st.markdown("### 🔧 Advanced Options")
+    opt1, opt2, opt3 = st.columns(3)
+    with opt1:
+        ip_timeframe = st.selectbox("⏱️ Timeframe", options=list(TIMEFRAME_MAP.keys()), index=2,
+            help="Investment horizon")
+        ip_risk = st.selectbox("⚖️ Risk Preference (advisory)", options=["Low", "Medium", "High"], index=1,
+            help="Soft preference — the system may override if your target demands higher risk")
+    with opt2:
+        available_sectors = get_sectors_for_market(ip_market)
+        ip_sectors = st.multiselect("🏢 Sector Preferences", options=available_sectors, default=[],
+            help="Leave empty for all sectors")
+        ip_num_stocks = st.slider("📊 Number of Stocks", min_value=2, max_value=15, value=5, step=1)
+    with opt3:
+        st.markdown(f"**Universe Size:** {get_universe_size(ip_market)} stocks")
+        st.markdown(f"**Sectors Available:** {len(available_sectors)}")
 
-    opt_col1, opt_col2, opt_col3 = st.columns(3)
+    # ── Live Feasibility Preview ────────────────────────────────────────
+    st.markdown("---")
+    _tf_info = TIMEFRAME_MAP.get(ip_timeframe, TIMEFRAME_MAP['1 Year'])
+    _years = _tf_info['years']
+    # Convert to USD for calculation if in INR mode
+    _amt_usd = ip_amount / USD_TO_INR if st.session_state.get('currency') == 'INR' else ip_amount
+    _gv_usd = ip_goal_value
+    if ip_goal_mode in ('Target Final Value', 'Target Profit') and st.session_state.get('currency') == 'INR':
+        _gv_usd = ip_goal_value / USD_TO_INR
 
-    with opt_col1:
-        ip_timeframe = st.selectbox(
-            "⏱️ Investment Timeframe",
-            options=list(TIMEFRAME_MAP.keys()),
-            index=3,
-            help="How long you plan to hold the investment"
-        )
-        ip_risk = st.selectbox(
-            "⚖️ Risk Tolerance",
-            options=["Low", "Medium", "High"],
-            index=1,
-            help="Your appetite for portfolio volatility"
-        )
+    _cagr, _tv, _ann = FeasibilityEngine.normalize_goal(_amt_usd, ip_goal_mode, _gv_usd, _years)
+    _flabel, _fcolor, _ftext = FeasibilityEngine.classify(_cagr)
+    _prob = FeasibilityEngine.estimate_probability(_cagr)
+    _rp = FeasibilityEngine.derive_risk_profile(_cagr, ip_risk)
 
-    with opt_col2:
-        ip_sectors = st.multiselect(
-            "🏢 Sector Preferences",
-            options=AVAILABLE_SECTORS,
-            default=[],
-            help="Leave empty for all sectors"
-        )
-        ip_num_stocks = st.slider(
-            "📊 Number of Stocks",
-            min_value=2, max_value=15, value=5, step=1,
-            help="How many stocks to include in your allocation"
-        )
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    with fc1:
+        st.metric("Required CAGR", f"{_cagr*100:.1f}%")
+    with fc2:
+        st.metric("Probability", f"~{_prob:.0f}%")
+    with fc3:
+        st.metric("Risk Required", _rp['effective'])
+    with fc4:
+        st.metric("Classification", _flabel)
 
-    with opt_col3:
-        ip_strategy = st.selectbox(
-            "📈 Market Strategy",
-            options=["AI-selected", "Growth", "Value", "Dividend", "Momentum"],
-            index=0,
-            help="Investment philosophy to guide allocation"
-        )
+    # Feasibility explanation box
+    if _flabel in ('Speculative', 'Unrealistic'):
+        box_class = 'warning-box'
+    elif _flabel == 'Aggressive':
+        box_class = 'warning-box'
+    else:
+        box_class = 'info-box'
+
+    st.markdown(f"""
+    <div class='{box_class}' style='border-left-color: {_fcolor};'>
+        <h4>🎯 Goal Feasibility: {_flabel}</h4>
+        <p>{_ftext}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if _rp['mismatch']:
+        st.markdown(f"""
+        <div class='warning-box'>
+            <h4>⚠️ Risk Preference Mismatch</h4>
+            <p>{_rp['mismatch_message']}</p>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── Generate Button ─────────────────────────────────────────────────────
+    # ── Generate Button ─────────────────────────────────────────────────
     if st.button("🚀 Generate Investment Plan", type="primary"):
-        # Convert display currency amount back to USD for computation
-        if st.session_state.get('currency') == 'INR':
-            ip_amount_usd = ip_amount / USD_TO_INR
-        else:
-            ip_amount_usd = ip_amount
-
         progress_bar = st.progress(0)
         status_text = st.empty()
-
         def _progress(pct, msg):
             progress_bar.progress(min(pct, 1.0))
             status_text.text(msg)
@@ -5523,10 +5537,12 @@ if active_tab == 15:
             try:
                 planner = InvestmentPlanner()
                 plan = planner.generate_plan(
-                    investment_amount=ip_amount_usd,
-                    target_return_pct=ip_target,
+                    investment_amount=_amt_usd,
+                    goal_mode=ip_goal_mode,
+                    goal_value=_gv_usd,
                     timeframe=ip_timeframe,
-                    risk_tolerance=ip_risk,
+                    risk_preference=ip_risk,
+                    market=ip_market,
                     sector_preferences=ip_sectors if ip_sectors else None,
                     strategy=ip_strategy,
                     num_stocks=ip_num_stocks,
@@ -5534,13 +5550,12 @@ if active_tab == 15:
                 )
                 st.session_state.investment_plan = plan
             except Exception as e:
-                st.error(f"❌ Error generating plan: {str(e)}")
+                st.error(f"❌ Error: {str(e)}")
                 logger.error(f"Investment Planner error: {str(e)}", exc_info=True)
-
         progress_bar.empty()
         status_text.empty()
 
-    # ── Results ─────────────────────────────────────────────────────────────
+    # ── Results ─────────────────────────────────────────────────────────
     plan = st.session_state.investment_plan
     if plan is not None:
         if not plan.get('success', False):
@@ -5549,252 +5564,203 @@ if active_tab == 15:
             allocs = plan['allocations']
             analytics = plan['analytics']
             params = plan['parameters']
+            feas = plan['feasibility']
 
             st.markdown(f"""
             <div class='success-box'>
-                <h4>✅ Investment Plan Generated</h4>
-                <p>Analyzed {len(STOCK_UNIVERSE)} stocks and selected the top
+                <h4>✅ Investment Plan Generated — {params['market']}</h4>
+                <p>Scanned {get_universe_size(params['market'])} stocks, selected top
                 {analytics['num_stocks']} across {analytics['num_sectors']} sector(s)
-                for your {params['timeframe']} plan.</p>
+                for your {params['timeframe']} {params['strategy']} plan.</p>
             </div>
             """, unsafe_allow_html=True)
 
-            # ── Summary Metrics ──────────────────────────────────────────────
+            # ── Feasibility Card ────────────────────────────────────────
+            st.markdown("### 🎯 Goal Feasibility Assessment")
+            f1, f2, f3, f4, f5 = st.columns(5)
+            with f1:
+                st.metric("Required CAGR", f"{feas['required_cagr']:.1f}%")
+            with f2:
+                st.metric("Probability", f"~{feas['probability']:.0f}%")
+            with f3:
+                st.metric("Classification", feas['label'])
+            with f4:
+                st.metric("Risk Derived", feas['risk_profile']['effective'])
+            with f5:
+                st.metric("Target Value", format_currency(feas['target_value']))
+
+            fl = feas['label']
+            fc = feas['color']
+            ft = feas['text']
+            st.markdown(f"""
+            <div class='info-box' style='border-left-color: {fc};'>
+                <h4>{fl}</h4>
+                <p>{ft}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if feas['risk_profile']['mismatch']:
+                st.markdown(f"""
+                <div class='warning-box'>
+                    <h4>⚠️ Risk Adjustment Applied</h4>
+                    <p>{feas['risk_profile']['mismatch_message']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ── Summary Metrics ─────────────────────────────────────────
             st.markdown("### 📊 Portfolio Summary")
             m1, m2, m3, m4, m5 = st.columns(5)
-
             with m1:
-                st.metric("Investment",
-                          format_currency(params['investment_amount']))
+                st.metric("Investment", format_currency(params['investment_amount']))
             with m2:
-                st.metric("Expected Return",
-                          f"{analytics['total_expected_return_pct']:+.1f}%",
-                          format_currency(analytics['total_expected_return'], plus=True))
+                st.metric("Base Expected CAGR", f"{analytics['weighted_expected_cagr']:+.1f}%",
+                          "Probability-adjusted")
             with m3:
-                st.metric("Est. Final Value",
-                          format_currency(analytics['estimated_final_value']))
+                st.metric("Est. Base Final Value", format_currency(analytics['estimated_final_value']))
             with m4:
-                st.metric("Portfolio Risk",
-                          analytics['risk_label'],
-                          f"Score: {analytics['risk_score']:.0f}/100")
+                st.metric("Portfolio Risk", analytics['risk_label'],
+                          f"Vol: {analytics['weighted_volatility']:.1f}%")
             with m5:
-                st.metric("Diversification",
-                          f"{analytics['diversification_score']:.0f}/100",
+                st.metric("Diversification", f"{analytics['diversification_score']:.0f}/100",
                           f"{analytics['num_sectors']} sector(s)")
 
             st.markdown("---")
 
-            # ── Target Feasibility ───────────────────────────────────────────
-            feas = analytics['target_feasibility']
-            feas_color = analytics['target_feasibility_color']
-            st.markdown(f"""
-            <div class='info-box' style='border-left-color: {feas_color};'>
-                <h4>🎯 Target Analysis: {feas}</h4>
-                <p>Your target of <b>{params['target_return_pct']:.1f}%</b> return
-                vs projected portfolio return of
-                <b>{analytics['weighted_projected_return']:+.1f}%</b> over
-                {params['timeframe']}. Weighted Sharpe Ratio:
-                <b>{analytics['weighted_sharpe']:.2f}</b>,
-                Weighted Volatility: <b>{analytics['weighted_volatility']:.1f}%</b>,
-                Confidence: <b>{analytics['weighted_confidence']:.0f}%</b>.</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-            st.markdown("---")
-
-            # ── Allocation Table ─────────────────────────────────────────────
+            # ── Allocation Table ────────────────────────────────────────
             st.markdown("### 📋 Stock Allocation")
-
             table_data = []
             for a in allocs:
                 table_data.append({
-                    'Ticker': a['ticker'],
-                    'Company': a['name'],
-                    'Sector': a['sector'],
-                    'Price': a['current_price'],
-                    'Alloc %': a['allocation_pct'],
-                    'Amount': a['allocation_amount'],
-                    'Est. Shares': a['estimated_shares'],
-                    'Proj. Return %': a['projected_return_pct'],
-                    'Confidence': a['confidence'],
-                    'Signal': a['recommendation'],
-                    'Risk': a['risk_rating']['rating'],
+                    'Ticker': a['ticker'], 'Company': a['name'], 'Sector': a['sector'],
+                    'Price': a['current_price'], 'Alloc %': a['allocation_pct'],
+                    'Amount': a['allocation_amount'], 'Est. Shares': a['estimated_shares'],
+                    'Expected CAGR': a['expected_cagr'] * 100, 'Proj. Return %': a['projected_return_pct'],
+                    'Confidence': a['confidence'], 'Signal': a['recommendation'], 'Risk': a['risk_rating']['rating'],
                 })
             alloc_df = pd.DataFrame(table_data)
-
-            sym = get_currency_symbol()
-            st.dataframe(
-                alloc_df.style.format({
-                    'Price': lambda v: format_currency(v),
-                    'Amount': lambda v: format_currency(v),
-                    'Est. Shares': '{:.2f}',
-                    'Alloc %': '{:.1f}%',
-                    'Proj. Return %': '{:+.1f}%',
-                    'Confidence': '{:.0f}%',
-                }),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(alloc_df.style.format({
+                'Price': lambda v: format_currency(v), 'Amount': lambda v: format_currency(v),
+                'Est. Shares': '{:.2f}', 'Alloc %': '{:.1f}%', 'Expected CAGR': '{:+.1f}%',
+                'Proj. Return %': '{:+.1f}%', 'Confidence': '{:.0f}%',
+            }), use_container_width=True, hide_index=True)
 
             st.markdown("---")
 
-            # ── Charts Row ───────────────────────────────────────────────────
-            chart_col1, chart_col2 = st.columns(2)
+            # ── Charts ──────────────────────────────────────────────────
+            chart1, chart2 = st.columns(2)
 
-            # Allocation Pie Chart
-            with chart_col1:
+            with chart1:
                 st.markdown("### 🥧 Allocation Breakdown")
                 pie_fig = go.Figure(data=[go.Pie(
                     labels=[a['ticker'] for a in allocs],
                     values=[a['allocation_pct'] for a in allocs],
                     textinfo='label+percent',
-                    hovertemplate='<b>%{label}</b><br>Allocation: %{percent}<br>'
-                                 + f'Amount: {sym}' + '%{value:.1f}%<extra></extra>',
                     marker=dict(colors=[
-                        '#818cf8', '#a78bfa', '#c084fc', '#e879f9',
-                        '#f472b6', '#fb7185', '#f97316', '#facc15',
-                        '#4ade80', '#2dd4bf', '#38bdf8', '#60a5fa',
-                        '#818cf8', '#a78bfa', '#c084fc'
+                        '#818cf8','#a78bfa','#c084fc','#e879f9','#f472b6',
+                        '#fb7185','#f97316','#facc15','#4ade80','#2dd4bf',
+                        '#38bdf8','#60a5fa','#818cf8','#a78bfa','#c084fc'
                     ][:len(allocs)]),
                     hole=0.4,
                 )])
-                pie_fig.update_layout(
-                    template='plotly_dark',
-                    height=400,
-                    showlegend=True,
-                    legend=dict(font=dict(size=11)),
-                    margin=dict(t=10, b=10, l=10, r=10),
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                )
+                pie_fig.update_layout(template='plotly_dark', height=400,
+                    showlegend=True, margin=dict(t=10,b=10,l=10,r=10),
+                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
                 st.plotly_chart(pie_fig, use_container_width=True)
 
-            # Projected Growth Trajectory
-            with chart_col2:
-                st.markdown("### 📈 Projected Growth")
-                traj = analytics['trajectory']
+            with chart2:
+                st.markdown("### 📈 Projected Growth (Bull / Base / Bear)")
+                traj = analytics['trajectories']
                 traj_fig = go.Figure()
+                # Bull
                 traj_fig.add_trace(go.Scatter(
-                    x=[t['month'] for t in traj],
-                    y=[convert_currency(t['value']) for t in traj],
-                    mode='lines+markers',
-                    name='Projected Value',
+                    x=[t['month'] for t in traj['bull']],
+                    y=[convert_currency(t['value']) for t in traj['bull']],
+                    mode='lines', name='Bull Case',
+                    line=dict(color='#10b981', width=2, dash='dot'),
+                    fill=None))
+                # Base
+                traj_fig.add_trace(go.Scatter(
+                    x=[t['month'] for t in traj['base']],
+                    y=[convert_currency(t['value']) for t in traj['base']],
+                    mode='lines+markers', name='Base Case',
                     line=dict(color='#818cf8', width=3),
-                    fill='tozeroy',
-                    fillcolor='rgba(129, 140, 248, 0.15)',
-                    marker=dict(size=6),
-                ))
-                traj_fig.add_hline(
-                    y=convert_currency(params['investment_amount']),
-                    line_dash="dash", line_color="gray", opacity=0.6,
-                    annotation_text="Initial Investment"
-                )
-                target_val = params['investment_amount'] * (1 + params['target_return_pct'] / 100)
-                traj_fig.add_hline(
-                    y=convert_currency(target_val),
-                    line_dash="dot", line_color="#10b981", opacity=0.6,
-                    annotation_text="Target Value"
-                )
-                traj_fig.update_layout(
-                    template='plotly_dark',
-                    height=400,
-                    xaxis_title="Month",
-                    yaxis_title=f"Portfolio Value ({get_currency_symbol()})",
-                    hovermode='x unified',
-                    margin=dict(t=10, b=40, l=60, r=10),
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                )
+                    fill='tonexty', fillcolor='rgba(129,140,248,0.1)',
+                    marker=dict(size=4)))
+                # Bear
+                traj_fig.add_trace(go.Scatter(
+                    x=[t['month'] for t in traj['bear']],
+                    y=[convert_currency(t['value']) for t in traj['bear']],
+                    mode='lines', name='Bear Case',
+                    line=dict(color='#ef4444', width=2, dash='dot')))
+                # Reference lines
+                traj_fig.add_hline(y=convert_currency(params['investment_amount']),
+                    line_dash="dash", line_color="gray", opacity=0.5, annotation_text="Initial")
+                traj_fig.add_hline(y=convert_currency(feas['target_value']),
+                    line_dash="dot", line_color="#facc15", opacity=0.5, annotation_text="Target")
+                traj_fig.update_layout(template='plotly_dark', height=400,
+                    xaxis_title="Month", yaxis_title=f"Value ({get_currency_symbol()})",
+                    hovermode='x unified', margin=dict(t=10,b=40,l=60,r=10),
+                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
                 st.plotly_chart(traj_fig, use_container_width=True)
 
             st.markdown("---")
 
-            # ── Risk vs Return Scatter ───────────────────────────────────────
+            # ── Risk vs Return ──────────────────────────────────────────
             st.markdown("### ⚖️ Risk vs Return Analysis")
             scatter_fig = go.Figure()
             for a in allocs:
                 scatter_fig.add_trace(go.Scatter(
-                    x=[a['volatility']],
-                    y=[a['projected_return_pct']],
-                    mode='markers+text',
-                    name=a['ticker'],
-                    text=[a['ticker']],
+                    x=[a['volatility']], y=[a['projected_return_pct']],
+                    mode='markers+text', name=a['ticker'], text=[a['ticker']],
                     textposition='top center',
-                    marker=dict(
-                        size=a['allocation_pct'] * 1.5 + 10,
-                        opacity=0.85,
-                    ),
+                    marker=dict(size=a['allocation_pct']*1.5+10, opacity=0.85),
                     hovertemplate=(
-                        f"<b>{a['ticker']}</b><br>"
-                        f"Volatility: {a['volatility']:.1f}%<br>"
-                        f"Proj Return: {a['projected_return_pct']:+.1f}%<br>"
-                        f"Allocation: {a['allocation_pct']:.1f}%<br>"
-                        f"Sharpe: {a['sharpe']:.2f}<extra></extra>"
-                    ),
-                ))
-            scatter_fig.update_layout(
-                template='plotly_dark',
-                height=420,
-                xaxis_title="Annualized Volatility (%)",
-                yaxis_title="Projected Return (%)",
-                hovermode='closest',
-                showlegend=False,
-                margin=dict(t=10, b=40, l=60, r=10),
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-            )
+                        f"<b>{a['ticker']}</b><br>Vol: {a['volatility']:.1f}%<br>"
+                        f"Return: {a['projected_return_pct']:+.1f}%<br>"
+                        f"Alloc: {a['allocation_pct']:.1f}%<br>Sharpe: {a['sharpe']:.2f}<extra></extra>")))
+            scatter_fig.update_layout(template='plotly_dark', height=420,
+                xaxis_title="Annualized Volatility (%)", yaxis_title="Projected Return (%)",
+                hovermode='closest', showlegend=False, margin=dict(t=10,b=40,l=60,r=10),
+                paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
             st.plotly_chart(scatter_fig, use_container_width=True)
 
             st.markdown("---")
 
-            # ── Sector Distribution ──────────────────────────────────────────
+            # ── Sector Distribution ─────────────────────────────────────
             st.markdown("### 🏢 Sector Distribution")
             sector_alloc = {}
             for a in allocs:
                 sector_alloc[a['sector']] = sector_alloc.get(a['sector'], 0) + a['allocation_pct']
-
             sec_fig = go.Figure(data=[go.Bar(
-                x=list(sector_alloc.keys()),
-                y=list(sector_alloc.values()),
+                x=list(sector_alloc.keys()), y=list(sector_alloc.values()),
                 marker_color='#818cf8',
-                text=[f"{v:.1f}%" for v in sector_alloc.values()],
-                textposition='auto',
-            )])
-            sec_fig.update_layout(
-                template='plotly_dark',
-                height=350,
-                xaxis_title="Sector",
-                yaxis_title="Allocation (%)",
-                margin=dict(t=10, b=40, l=60, r=10),
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-            )
+                text=[f"{v:.1f}%" for v in sector_alloc.values()], textposition='auto')])
+            sec_fig.update_layout(template='plotly_dark', height=350,
+                xaxis_title="Sector", yaxis_title="Allocation (%)",
+                margin=dict(t=10,b=40,l=60,r=10),
+                paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
             st.plotly_chart(sec_fig, use_container_width=True)
 
             st.markdown("---")
 
-            # ── Stock Detail Expanders ────────────────────────────────────────
+            # ── Stock Detail Expanders ──────────────────────────────────
             st.markdown("### 🔍 Stock-by-Stock Analysis")
-
             for a in allocs:
                 sig_emoji = TradingSignals.get_signal_emoji(a['recommendation'])
-                with st.expander(
-                    f"{sig_emoji} {a['ticker']} — {a['name']}  |  "
-                    f"Alloc: {a['allocation_pct']:.1f}%  |  "
-                    f"{a['recommendation']}"
-                ):
+                with st.expander(f"{sig_emoji} {a['ticker']} — {a['name']}  |  "
+                                 f"Alloc: {a['allocation_pct']:.1f}%  |  {a['recommendation']}"):
                     d1, d2, d3, d4 = st.columns(4)
                     with d1:
                         st.metric("Current Price", format_currency(a['current_price']))
                     with d2:
                         st.metric("Allocation", format_currency(a['allocation_amount']))
                     with d3:
-                        st.metric("Proj. Return",
-                                  f"{a['projected_return_pct']:+.1f}%",
-                                  format_currency(a['expected_return_contribution'], plus=True))
+                        st.metric("Exp. CAGR", f"{a['expected_cagr']*100:+.1f}%",
+                                  f"Total: {a['projected_return_pct']:+.1f}%")
                     with d4:
                         st.metric("Confidence", f"{a['confidence']:.0f}%")
-
                     d5, d6, d7, d8 = st.columns(4)
                     with d5:
                         st.metric("Volatility", f"{a['volatility']:.1f}%")
@@ -5804,7 +5770,6 @@ if active_tab == 15:
                         st.metric("Max Drawdown", f"-{a['max_drawdown']:.1f}%")
                     with d8:
                         st.metric("Risk Level", a['risk_rating']['rating'])
-
                     st.markdown(f"""
                     <div class='info-box'>
                         <h4>💡 AI Reasoning</h4>
@@ -5814,31 +5779,20 @@ if active_tab == 15:
 
             st.markdown("---")
 
-            # ── Entry Strategy Summary ───────────────────────────────────────
+            # ── Entry Strategy ──────────────────────────────────────────
             st.markdown("### 🚦 Suggested Entry Strategy")
-
             bullish_count = sum(1 for a in allocs if a['recommendation'] in ('BUY', 'STRONG BUY'))
             bearish_count = sum(1 for a in allocs if a['recommendation'] in ('SELL', 'STRONG SELL'))
-
             if bullish_count > bearish_count:
-                entry_advice = (
-                    "Market signals are predominantly bullish. Consider deploying "
-                    "capital in 2-3 tranches over the next 1-2 weeks to average "
-                    "entry prices while capturing upward momentum."
-                )
+                entry_advice = ("Market signals are predominantly bullish. Consider deploying "
+                    "capital in 2-3 tranches over the next 1-2 weeks.")
                 entry_class = 'success-box'
             elif bearish_count > bullish_count:
-                entry_advice = (
-                    "Some bearish signals detected. Consider a phased entry over "
-                    "4-6 weeks using dollar-cost averaging to mitigate short-term "
-                    "downside risk."
-                )
+                entry_advice = ("Bearish signals detected. Consider phased entry over "
+                    "4-6 weeks using dollar-cost averaging.")
                 entry_class = 'warning-box'
             else:
-                entry_advice = (
-                    "Mixed market signals. A balanced entry strategy is recommended: "
-                    "deploy 50% now and spread the remainder over 3-4 weeks."
-                )
+                entry_advice = ("Mixed signals. Deploy 50% now and spread the remainder over 3-4 weeks.")
                 entry_class = 'info-box'
 
             st.markdown(f"""
@@ -5850,13 +5804,26 @@ if active_tab == 15:
 
             st.markdown("---")
 
-            # ── Export ───────────────────────────────────────────────────────
-            st.markdown("### 💾 Export Plan")
+            # ── Outcome Range Summary ───────────────────────────────────
+            st.markdown("### 📊 Projected Outcome Range")
+            st.markdown("<p style='color:#94a3b8; font-size: 0.9em;'>Projections are probabilistic estimates derived from historical volatility and statistical shrinkage. They are not guaranteed returns.</p>", unsafe_allow_html=True)
+            or1, or2, or3 = st.columns(3)
+            with or1:
+                st.metric("🐻 Bear Case (P25)", format_currency(analytics['estimated_final_bear']),
+                          f"{((analytics['estimated_final_bear']/params['investment_amount'])-1)*100:+.1f}%")
+            with or2:
+                st.metric("📊 Base Case (Expected)", format_currency(analytics['estimated_final_value']),
+                          f"{((analytics['estimated_final_value']/params['investment_amount'])-1)*100:+.1f}%")
+            with or3:
+                st.metric("🐂 Bull Case (P75)", format_currency(analytics['estimated_final_bull']),
+                          f"{((analytics['estimated_final_bull']/params['investment_amount'])-1)*100:+.1f}%")
 
+            st.markdown("---")
+
+            # ── Export ──────────────────────────────────────────────────
+            st.markdown("### 💾 Export Plan")
             export_df = pd.DataFrame([{
-                'Ticker': a['ticker'],
-                'Company': a['name'],
-                'Sector': a['sector'],
+                'Ticker': a['ticker'], 'Company': a['name'], 'Sector': a['sector'],
                 'Current Price (USD)': f"${a['current_price']:.2f}",
                 'Allocation %': f"{a['allocation_pct']:.1f}%",
                 'Amount (USD)': f"${a['allocation_amount']:.2f}",
@@ -5866,29 +5833,26 @@ if active_tab == 15:
                 'Confidence': f"{a['confidence']:.0f}%",
                 'Signal': a['recommendation'],
                 'Risk Level': a['risk_rating']['rating'],
-                'Reasoning': a['reasoning'],
             } for a in allocs])
-
             csv_data = export_df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Investment Plan (CSV)",
-                data=csv_data,
+            st.download_button(label="📥 Download Investment Plan (CSV)", data=csv_data,
                 file_name=f"investment_plan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
+                mime="text/csv")
 
     else:
         st.markdown("""
         <div class='info-box'>
             <h4>💡 How It Works</h4>
-            <p>1. Set your investment amount and target return above.<br>
-            2. Optionally refine with timeframe, risk level, sectors, and strategy.<br>
-            3. Click <b>Generate Investment Plan</b> to receive AI-powered
+            <p>1. Select your market, Goal Type, and strategy above.<br>
+            2. Set your investment amount and target.<br>
+            3. Review the live feasibility assessment.<br>
+            4. Click <b>Generate Investment Plan</b> to receive AI-powered
             stock recommendations with allocation percentages, projections,
             risk analysis, and entry strategy — all based on real-time
             market data and technical analysis.</p>
         </div>
         """, unsafe_allow_html=True)
+
 
 # Compact Footer
 st.markdown("---")
