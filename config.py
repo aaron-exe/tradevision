@@ -1,4 +1,4 @@
-"""Configuration file for Stock Price Prediction with LSTM"""
+"""Configuration file for TradeVision — See the Market. Trade the Future."""
 
 # Model Hyperparameters
 SEQ_LENGTH = 60
@@ -39,6 +39,6 @@ FIGURE_SIZE = (14, 7)
 PLOT_STYLE = 'seaborn-v0_8-darkgrid'
 
 # Streamlit Config (ADD THESE LINES)
-PAGE_TITLE = "📈 Stock Price Predictor with LSTM"
+PAGE_TITLE = "TradeVision"
 PAGE_ICON = "📈"
 LAYOUT = "wide"

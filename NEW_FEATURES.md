@@ -1,6 +1,6 @@
 # 🚀 New Features Added
 
-## Three Powerful Features Added to Stock Price Predictor
+## Three Powerful Features Added to TradeVision
 
 ### 1. 🎯 Backtesting & Strategy Simulator (Tab 12)
 

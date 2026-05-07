@@ -1,6 +1,6 @@
 """
-Streamlit Dashboard for Stock Price Prediction
-Interactive web application for LSTM-based stock price forecasting
+TradeVision — See the Market. Trade the Future.
+AI-powered stock analysis, forecasting, and portfolio intelligence platform.
 """
 
 import os
@@ -398,11 +398,11 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # Title with enhanced subtitle
-st.markdown('<h1 class="main-header">📈 Stock Price Predictor with LSTM</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-header">TradeVision</h1>', unsafe_allow_html=True)
 st.markdown("""
 <div style='text-align: center; margin-bottom: 2rem;'>
     <p style='font-size: 1.2rem; color: #94a3b8; font-family: Poppins, sans-serif;'>
-        Harness the power of Deep Learning to predict stock market trends with precision
+        See the Market. Trade the Future.
     </p>
 </div>
 """, unsafe_allow_html=True)
@@ -796,7 +796,7 @@ with st.sidebar:
     with st.expander("ℹ️ About", expanded=False):
         st.markdown("""
         <div style='color: #e2e8f0;'>
-        <h4 style='color: #667eea;'>🤖 Stock Price Predictor</h4>
+        <h4 style='color: #667eea;'>TradeVision</h4>
         
         This advanced application leverages <b>LSTM (Long Short-Term Memory)</b> neural networks 
         to forecast stock prices using historical data and technical indicators.
@@ -3137,7 +3137,7 @@ if active_tab == 11:
     
     # Create comprehensive report text
     report_text = f"""
-STOCK PRICE PREDICTION REPORT
+TRADEVISION — STOCK ANALYSIS REPORT
 {'='*80}
 
 Report Generated:  {report_date}
@@ -5866,7 +5866,8 @@ st.markdown("""
     margin-top: 2rem;
     box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
 '>
-    <h3 style='margin: 0 0 0.5rem 0; font-family: Poppins, sans-serif;'>📈 Stock Price Predictor with LSTM</h3>
+    <h3 style='margin: 0 0 0.5rem 0; font-family: Poppins, sans-serif;'>TradeVision</h3>
+    <p style='font-size: 0.85rem; margin: 0 0 0.3rem 0; opacity: 0.9;'>See the Market. Trade the Future.</p>
     <p style='font-size: 0.95rem; margin: 0;'>
         Built with ❤️ using <strong>Streamlit</strong>, <strong>TensorFlow</strong> & <strong>Keras</strong>
     </p>
